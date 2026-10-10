@@ -1,0 +1,132 @@
+"""Хранилище.
+
+На диск пишутся ТОЛЬКО настройки чата, которые админ поменял сам:
+id чата, список стоп-слов и флаг «удалять комментарии от имени каналов».
+Никаких данных о пользователях и сообщениях здесь нет.
+
+Всё про пользователей (кто прошёл проверку, кто сейчас проходит) живёт
+только в оперативной памяти и исчезает при перезапуске бота.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+Key = Tuple[int, int]  # (chat_id, user_id)
+
+
+@dataclass
+class ChatSettings:
+    words: List[str] = field(default_factory=list)
+    block_channels: bool = True
+
+
+class Storage:
+    def __init__(self, path: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(path)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS chats ("
+            " chat_id INTEGER PRIMARY KEY,"
+            " words TEXT NOT NULL DEFAULT '[]',"
+            " block_channels INTEGER NOT NULL DEFAULT 1)"
+        )
+        self._db.commit()
+        self._cache: Dict[int, ChatSettings] = {}
+
+    def get(self, chat_id: int) -> ChatSettings:
+        if chat_id not in self._cache:
+            row = self._db.execute(
+                "SELECT words, block_channels FROM chats WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            self._cache[chat_id] = (
+                ChatSettings(json.loads(row[0]), bool(row[1])) if row else ChatSettings()
+            )
+        return self._cache[chat_id]
+
+    def save(self, chat_id: int, settings: ChatSettings) -> None:
+        self._cache[chat_id] = settings
+        self._db.execute(
+            "INSERT OR REPLACE INTO chats (chat_id, words, block_channels) VALUES (?, ?, ?)",
+            (chat_id, json.dumps(settings.words, ensure_ascii=False), int(settings.block_channels)),
+        )
+        self._db.commit()
+
+    def delete(self, chat_id: int) -> None:
+        self._cache.pop(chat_id, None)
+        self._db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+        self._db.commit()
+
+
+@dataclass
+class Pending:
+    correct: int
+    message_id: Optional[int] = None
+    task: Optional[asyncio.Task] = None
+
+
+@dataclass
+class ChatStats:
+    deleted: int = 0
+    passed: int = 0
+    failed: int = 0
+
+
+class Memory:
+    """Состояние в оперативной памяти. На диск не попадает."""
+
+    VERIFIED_LIMIT = 200_000
+    CACHE_TTL = 600
+
+    def __init__(self) -> None:
+        self.verified: Dict[Key, None] = {}  # dict как упорядоченное множество
+        self.pending: Dict[Key, Pending] = {}
+        self.stats: Dict[int, ChatStats] = {}
+        self._admins: Dict[int, Tuple[float, Set[int]]] = {}
+        self._linked: Dict[int, Tuple[float, Optional[int]]] = {}
+
+    def is_verified(self, key: Key) -> bool:
+        return key in self.verified
+
+    def verify(self, key: Key) -> None:
+        self.verified.pop(key, None)
+        self.verified[key] = None
+        if len(self.verified) > self.VERIFIED_LIMIT:
+            for old in list(self.verified)[: self.VERIFIED_LIMIT // 10]:
+                del self.verified[old]
+
+    def stat(self, chat_id: int) -> ChatStats:
+        return self.stats.setdefault(chat_id, ChatStats())
+
+    def cached_admins(self, chat_id: int) -> Optional[Set[int]]:
+        entry = self._admins.get(chat_id)
+        return entry[1] if entry and entry[0] > time.monotonic() else None
+
+    def set_admins(self, chat_id: int, admins: Set[int]) -> None:
+        self._admins[chat_id] = (time.monotonic() + self.CACHE_TTL, admins)
+
+    def cached_linked(self, chat_id: int) -> Tuple[bool, Optional[int]]:
+        entry = self._linked.get(chat_id)
+        if entry and entry[0] > time.monotonic():
+            return True, entry[1]
+        return False, None
+
+    def set_linked(self, chat_id: int, linked: Optional[int]) -> None:
+        self._linked[chat_id] = (time.monotonic() + self.CACHE_TTL, linked)
+
+    def forget_chat(self, chat_id: int) -> None:
+        for key in [k for k in self.verified if k[0] == chat_id]:
+            del self.verified[key]
+        for key in [k for k in self.pending if k[0] == chat_id]:
+            p = self.pending.pop(key)
+            if p.task:
+                p.task.cancel()
+        self.stats.pop(chat_id, None)
+        self._admins.pop(chat_id, None)
+        self._linked.pop(chat_id, None)
