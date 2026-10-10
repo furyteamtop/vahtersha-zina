@@ -4,8 +4,9 @@
 id чата, список стоп-слов и флаг «удалять комментарии от имени каналов».
 Никаких данных о пользователях и сообщениях здесь нет.
 
-Всё про пользователей (кто прошёл проверку, кто сейчас проходит) живёт
-только в оперативной памяти и исчезает при перезапуске бота.
+Всё про пользователей (кто прошёл проверку, кто сейчас проходит и его
+комментарий, ждущий проверки) живёт только в оперативной памяти и исчезает
+после ответа на вопрос или при перезапуске бота.
 """
 
 from __future__ import annotations
@@ -16,7 +17,10 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from aiogram.types import Message
 
 Key = Tuple[int, int]  # (chat_id, user_id)
 
@@ -69,6 +73,8 @@ class Pending:
     correct: int
     message_id: Optional[int] = None
     task: Optional[asyncio.Task] = None
+    # Комментарии новичка, ждущие проверки. Только в памяти: после ответа или таймаута стираются.
+    messages: List["Message"] = field(default_factory=list)
 
 
 @dataclass

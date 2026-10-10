@@ -6,9 +6,10 @@ import time
 from typing import Optional, Set
 
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart, Filter
+from aiogram.methods import SendMessage
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
@@ -28,6 +29,8 @@ router = Router()
 
 GROUPS = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
 TELEGRAM_SERVICE_ID = 777000  # «Telegram»: автопересылка постов канала в обсуждение
+MAX_HELD_MESSAGES = 10  # сколько комментариев новичка держим до проверки (альбом — до 10 штук)
+TEXT_LIMIT, CAPTION_LIMIT = 4096, 1024
 
 
 # ---------- вспомогательное ----------
@@ -114,6 +117,47 @@ def user_name_is_spam(user: User, words) -> bool:
     return spam.is_spam(user.full_name, words)
 
 
+# ---------- публикация комментария после проверки ----------
+
+def reply_target(message: Message) -> dict:
+    """Куда отвечать, чтобы сообщение попало в ту же ветку комментариев."""
+    if message.chat.is_forum and message.message_thread_id:
+        return {"message_thread_id": message.message_thread_id}
+    target = (
+        message.reply_to_message.message_id if message.reply_to_message else message.message_thread_id
+    )
+    if not target:
+        return {}
+    return {"reply_parameters": ReplyParameters(message_id=target, allow_sending_without_reply=True)}
+
+
+def build_copies(message: Message, chat_id: int, header: str) -> list:
+    """Копия комментария от имени бота с подписью автора сверху."""
+    where = reply_target(message)
+    copy = message.send_copy(chat_id, parse_mode=ParseMode.HTML, **where)
+    body_len = len(message.text or message.caption or "")
+    if isinstance(copy, SendMessage) and body_len + len(header) < TEXT_LIMIT:
+        return [copy.model_copy(update={"text": f"{header}\n{message.html_text}", "entities": None})]
+    if "caption" in type(copy).model_fields and body_len + len(header) < CAPTION_LIMIT:
+        caption = f"{header}\n{message.html_text}" if message.caption else header
+        return [copy.model_copy(update={"caption": caption, "caption_entities": None})]
+    # стикер, кружок и т.п. без подписи — сначала имя автора, потом само сообщение
+    return [SendMessage(chat_id=chat_id, text=header, parse_mode=ParseMode.HTML, **where), copy]
+
+
+async def republish(bot: Bot, chat_id: int, user: User, messages: list) -> bool:
+    header = texts.REPOST_HEADER.format(mention=user.mention_html())
+    ok = True
+    for message in messages:
+        try:
+            for method in build_copies(message, chat_id, header):
+                await bot(method)
+        except (TelegramAPIError, TypeError) as e:  # TypeError — тип сообщения нельзя скопировать
+            log.warning("Не удалось опубликовать комментарий: %s", type(e).__name__)
+            ok = False
+    return ok
+
+
 # ---------- капча ----------
 
 async def expire_captcha(bot: Bot, cfg: Config, mem: Memory, key: Key) -> None:
@@ -130,7 +174,7 @@ async def expire_captcha(bot: Bot, cfg: Config, mem: Memory, key: Key) -> None:
 async def send_captcha(message: Message, bot: Bot, cfg: Config, mem: Memory, key: Key) -> None:
     user = message.from_user
     challenge = captcha.generate()
-    pending = Pending(correct=challenge.correct)
+    pending = Pending(correct=challenge.correct, messages=[message])
     mem.pending[key] = pending
 
     buttons = [
@@ -195,8 +239,9 @@ async def on_captcha_answer(cb: CallbackQuery, bot: Bot, cfg: Config, mem: Memor
     if answer == pending.correct:
         mem.verify(key)
         mem.stat(chat_id).passed += 1
-        await cb.answer(texts.PASSED, show_alert=True)
         await safe_delete(bot, chat_id, cb.message.message_id)
+        published = await republish(bot, chat_id, cb.from_user, pending.messages)
+        await cb.answer(texts.PASSED if published else texts.PASSED_RESEND, show_alert=True)
     else:
         mem.stat(chat_id).failed += 1
         await cb.answer(texts.failed(cfg.fail_ban_minutes), show_alert=True)
@@ -329,9 +374,22 @@ async def check_message(
         return
 
     # Непроверенный: сообщение убираем сразу, чтобы спам никто не увидел.
+    # Если человек пройдёт проверку, Зина опубликует его комментарий сама.
     if await safe_delete(bot, chat_id, message.message_id):
         stats.deleted += 1
-    if edited or key in mem.pending:
+    if edited:
+        return
+    pending = mem.pending.get(key)
+    if pending is not None:
+        if is_spam:
+            mem.pending.pop(key, None)
+            if pending.task:
+                pending.task.cancel()
+            await safe_delete(bot, chat_id, pending.message_id)
+            stats.failed += 1
+            await ban_forever(bot, chat_id, user.id)
+        elif len(pending.messages) < MAX_HELD_MESSAGES:
+            pending.messages.append(message)
         return
     if is_spam or user_name_is_spam(user, settings.words):
         stats.failed += 1

@@ -16,6 +16,8 @@ from aiogram.methods import (
     GetChat,
     GetChatAdministrators,
     SendMessage,
+    SendPhoto,
+    SendSticker,
 )
 from aiogram.types import Message, Update
 
@@ -65,12 +67,12 @@ _message_ids = itertools.count(1)
 
 
 def comment(text, user_id=USER, sender_chat=None, name="Вася", **extra):
+    """Комментарий в ветке поста. text=None — сообщение без текста (передайте фото/стикер в extra)."""
     msg = {
         "message_id": next(_message_ids),
         "date": int(time.time()),
         "chat": {"id": GROUP, "type": "supergroup", "title": "Обсуждение"},
         "from": {"id": user_id, "is_bot": False, "first_name": name},
-        "text": text,
         "message_thread_id": THREAD_ROOT,
         "reply_to_message": {
             "message_id": THREAD_ROOT, "date": int(time.time()),
@@ -80,6 +82,8 @@ def comment(text, user_id=USER, sender_chat=None, name="Вася", **extra):
     if sender_chat:
         msg["from"] = {"id": 136817688, "is_bot": True, "first_name": "Channel_Bot"}
         msg["sender_chat"] = {"id": sender_chat, "type": "channel", "title": "Канал"}
+    if text is not None:
+        msg["text"] = text
     msg.update(extra)
     return Update.model_validate({"update_id": next(_update_ids), "message": msg})
 
@@ -197,6 +201,59 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dp["store"].get(GROUP).words, ["казино"])
         await self.feed(comment("/addword чужое", sender_chat=ALIEN_CHANNEL))
         self.assertEqual(self.dp["store"].get(GROUP).words, ["казино"])
+
+    def reposts(self):
+        """Что Зина опубликовала, кроме самой капчи."""
+        return [c for c in self.session.calls
+                if isinstance(c, (SendMessage, SendPhoto, SendSticker)) and "пропуск" not in (getattr(c, "text", "") or "")]
+
+    async def test_comment_is_published_after_passing(self):
+        await self.feed(comment("Классный пост, <спасибо>!"))
+        await self.feed(comment("И ещё вопрос"))  # второй, пока висит капча
+        p = self.captcha()
+        await self.feed(press(USER, f"z:{USER}:{p.correct}", p.message_id))
+
+        posts = self.reposts()
+        self.assertEqual(len(posts), 2)
+        self.assertIn('href="tg://user?id=20"', posts[0].text)
+        self.assertIn("Классный пост, &lt;спасибо&gt;!", posts[0].text)  # HTML экранирован
+        self.assertIn("И ещё вопрос", posts[1].text)
+        self.assertEqual(posts[0].reply_parameters.message_id, THREAD_ROOT)
+        answer = self.session.of(AnswerCallbackQuery)[-1]
+        self.assertIn("опубликовала", answer.text)
+
+    async def test_photo_and_sticker_are_published(self):
+        photo = [{"file_id": "PHOTO", "file_unique_id": "p", "width": 10, "height": 10}]
+        await self.feed(comment(None, photo=photo, caption="Мой кот"))
+        sticker = {"file_id": "STICKER", "file_unique_id": "s", "type": "regular",
+                   "width": 10, "height": 10, "is_animated": False, "is_video": False}
+        await self.feed(comment(None, sticker=sticker))
+        p = self.captcha()
+        await self.feed(press(USER, f"z:{USER}:{p.correct}", p.message_id))
+
+        sent_photo = self.session.of(SendPhoto)
+        self.assertEqual(len(sent_photo), 1)
+        self.assertEqual(sent_photo[0].photo, "PHOTO")
+        self.assertIn("Мой кот", sent_photo[0].caption)
+        self.assertIn("tg://user?id=20", sent_photo[0].caption)
+        self.assertEqual(len(self.session.of(SendSticker)), 1)
+        # перед стикером — подпись с автором
+        self.assertTrue(any("tg://user?id=20" in (m.text or "") for m in self.session.of(SendMessage)))
+
+    async def test_nothing_published_on_wrong_answer(self):
+        await self.feed(comment("Привет"))
+        p = self.captcha()
+        await self.feed(press(USER, f"z:{USER}:{(p.correct + 1) % 3}", p.message_id))
+        self.assertEqual(self.reposts(), [])
+
+    async def test_spam_while_waiting_bans(self):
+        await self.feed(comment("Привет"))
+        await self.feed(comment("пиши мне в лс, покажу фото"))
+        self.assertNotIn((GROUP, USER), self.mem.pending)
+        bans = self.session.of(BanChatMember)
+        self.assertEqual(len(bans), 1)
+        self.assertIsNone(bans[0].until_date)
+        self.assertEqual(self.reposts(), [])
 
     async def test_answers_callback(self):
         await self.feed(comment("Привет"))
