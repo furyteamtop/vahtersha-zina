@@ -1,12 +1,13 @@
 """Хранилище.
 
-На диск пишутся ТОЛЬКО настройки чата, которые админ поменял сам:
-id чата, список стоп-слов и флаг «удалять комментарии от имени каналов».
+На диск пишутся ТОЛЬКО настройки, которые админ поменял сам:
+- для группы: id, список стоп-слов и флаг «удалять комментарии от имени каналов»;
+- для канала: id, подпись к постам, кнопки-ссылки и флаг автоподписи.
 Никаких данных о пользователях и сообщениях здесь нет.
 
 Всё про пользователей (кто прошёл проверку, кто сейчас проходит и его
-комментарий, ждущий проверки) живёт только в оперативной памяти и исчезает
-после ответа на вопрос или при перезапуске бота.
+комментарий, ждущий проверки, черновик поста) живёт только в оперативной
+памяти и исчезает после ответа на вопрос / публикации или при перезапуске бота.
 """
 
 from __future__ import annotations
@@ -31,6 +32,16 @@ class ChatSettings:
     block_channels: bool = True
 
 
+Buttons = List[List[Dict[str, str]]]  # ряды кнопок: [[{"text": ..., "url": ...}, ...], ...]
+
+
+@dataclass
+class ChannelSettings:
+    signature: str = ""  # HTML, дописывается в конец поста
+    buttons: Buttons = field(default_factory=list)
+    auto: bool = True  # дописывать к постам, опубликованным прямо в канале
+
+
 class Storage:
     def __init__(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -41,8 +52,39 @@ class Storage:
             " words TEXT NOT NULL DEFAULT '[]',"
             " block_channels INTEGER NOT NULL DEFAULT 1)"
         )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS channels ("
+            " chat_id INTEGER PRIMARY KEY,"
+            " signature TEXT NOT NULL DEFAULT '',"
+            " buttons TEXT NOT NULL DEFAULT '[]',"
+            " auto INTEGER NOT NULL DEFAULT 1)"
+        )
         self._db.commit()
         self._cache: Dict[int, ChatSettings] = {}
+        self._channels: Dict[int, ChannelSettings] = {}
+
+    def channel(self, chat_id: int) -> ChannelSettings:
+        if chat_id not in self._channels:
+            row = self._db.execute(
+                "SELECT signature, buttons, auto FROM channels WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            self._channels[chat_id] = (
+                ChannelSettings(row[0], json.loads(row[1]), bool(row[2])) if row else ChannelSettings()
+            )
+        return self._channels[chat_id]
+
+    def save_channel(self, chat_id: int, settings: ChannelSettings) -> None:
+        self._channels[chat_id] = settings
+        self._db.execute(
+            "INSERT OR REPLACE INTO channels (chat_id, signature, buttons, auto) VALUES (?, ?, ?, ?)",
+            (chat_id, settings.signature, json.dumps(settings.buttons, ensure_ascii=False), int(settings.auto)),
+        )
+        self._db.commit()
+
+    def delete_channel(self, chat_id: int) -> None:
+        self._channels.pop(chat_id, None)
+        self._db.execute("DELETE FROM channels WHERE chat_id = ?", (chat_id,))
+        self._db.commit()
 
     def get(self, chat_id: int) -> ChatSettings:
         if chat_id not in self._cache:
@@ -78,6 +120,13 @@ class Pending:
 
 
 @dataclass
+class Album:
+    items: List["Message"] = field(default_factory=list)
+    done: bool = False
+    task: Optional[asyncio.Task] = None
+
+
+@dataclass
 class ChatStats:
     deleted: int = 0
     passed: int = 0
@@ -96,6 +145,14 @@ class Memory:
         self.stats: Dict[int, ChatStats] = {}
         self._admins: Dict[int, Tuple[float, Set[int]]] = {}
         self._linked: Dict[int, Tuple[float, Optional[int]]] = {}
+        # постер
+        self.drafts: Dict[int, Tuple[int, "Message"]] = {}  # user_id -> (канал, черновик поста)
+        self.user_channels: Dict[int, List[int]] = {}  # недавние каналы админа — для быстрого выбора
+        self.albums: Dict[str, Album] = {}  # альбомы, которые сейчас подписываются
+
+    def remember_channel(self, user_id: int, chat_id: int) -> None:
+        recent = [c for c in self.user_channels.get(user_id, []) if c != chat_id]
+        self.user_channels[user_id] = ([chat_id] + recent)[:5]
 
     def is_verified(self, key: Key) -> bool:
         return key in self.verified

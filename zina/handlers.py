@@ -9,6 +9,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart, Filter
+from aiogram.fsm.context import FSMContext
 from aiogram.methods import SendMessage
 from aiogram.types import (
     CallbackQuery,
@@ -428,7 +429,8 @@ async def on_my_status(event: ChatMemberUpdated, bot: Bot, mem: Memory, store: S
 
 @router.message(F.chat.type == ChatType.PRIVATE, CommandStart())
 @router.message(F.chat.type == ChatType.PRIVATE, Command("help"))
-async def cmd_start(message: Message, bot: Bot) -> None:
+async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
+    await state.clear()
     me = await bot.me()
     await message.answer(texts.HELP.format(username=me.username))
 

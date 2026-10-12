@@ -10,6 +10,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators, BotC
 from . import texts
 from .config import load_config
 from .handlers import router
+from .poster import router as poster_router
 from .storage import Memory, Storage
 
 
@@ -21,6 +22,7 @@ async def main() -> None:
 
     bot = Bot(cfg.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     dp = Dispatcher(cfg=cfg, mem=Memory(), store=Storage(cfg.db_path))
+    dp.include_router(poster_router)  # раньше основного: его шаги в личке важнее общего ответа
     dp.include_router(router)
 
     try:
@@ -34,6 +36,7 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Что умеет Зина и как подключить"),
+            BotCommand(command="poster", description="Подпись, кнопки и посты для канала"),
             BotCommand(command="privacy", description="Какие данные хранятся"),
         ],
         scope=BotCommandScopeAllPrivateChats(),
