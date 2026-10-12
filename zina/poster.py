@@ -285,7 +285,10 @@ def menu_markup(channel_id: int, s: ChannelSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"🤖 Автоподпись: {'вкл' if s.auto else 'выкл'}", callback_data=f"p:auto:{channel_id}"
         )],
-        [InlineKeyboardButton(text="📝 Новый пост", callback_data=f"p:new:{channel_id}")],
+        [
+            InlineKeyboardButton(text="👁 Предпросмотр", callback_data=f"p:prev:{channel_id}"),
+            InlineKeyboardButton(text="📝 Новый пост", callback_data=f"p:new:{channel_id}"),
+        ],
     ]
     clean = []
     if s.signature:
@@ -307,6 +310,18 @@ def menu_text(title: str, s: ChannelSettings, warnings: List[str]) -> str:
         buttons=buttons or "<i>нет</i>",
         auto=texts.POSTER_AUTO_ON if s.auto else texts.POSTER_AUTO_OFF,
         warnings=("\n\n" + "\n".join(f"⚠️ {w}" for w in warnings)) if warnings else "",
+    )
+
+
+async def send_sample(bot: Bot, chat_id: int, s: ChannelSettings) -> None:
+    """Пример поста с текущей подписью и кнопками — как он будет выглядеть в канале."""
+    if not (s.signature or s.buttons):
+        await bot.send_message(chat_id, texts.POSTER_SAMPLE_EMPTY)
+        return
+    text = texts.POSTER_SAMPLE + (f"\n\n{s.signature}" if s.signature else "")
+    await bot.send_message(
+        chat_id, text, reply_markup=keyboard(s.buttons),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 
@@ -387,6 +402,9 @@ async def on_menu(cb: CallbackQuery, bot: Bot, mem: Memory, store: Storage, stat
         await state.clear()
         await cb.answer()
         await show_menu(bot, store, chat_id, channel_id, warnings)
+    elif action == "prev":
+        await cb.answer()
+        await send_sample(bot, chat_id, s)
     elif action == "auto":
         s.auto = not s.auto
         store.save_channel(channel_id, s)
@@ -439,7 +457,8 @@ async def got_signature(message: Message, bot: Bot, store: Storage, state: FSMCo
     s.signature = message.html_text
     store.save_channel(channel_id, s)
     await state.clear()
-    await message.answer("Подпись сохранила ✅")
+    await message.answer("Подпись сохранила ✅ Вот как будет выглядеть пост:")
+    await send_sample(bot, message.chat.id, s)
     await show_menu(bot, store, message.chat.id, channel_id, warnings)
 
 
@@ -458,7 +477,8 @@ async def got_buttons(message: Message, bot: Bot, store: Storage, state: FSMCont
     s.buttons = buttons
     store.save_channel(channel_id, s)
     await state.clear()
-    await message.answer("Кнопки сохранила ✅")
+    await message.answer("Кнопки сохранила ✅ Вот как будет выглядеть пост:")
+    await send_sample(bot, message.chat.id, s)
     await show_menu(bot, store, message.chat.id, channel_id, warnings)
 
 

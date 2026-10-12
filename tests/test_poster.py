@@ -252,6 +252,20 @@ class PosterTest(unittest.IsolatedAsyncioTestCase):
         sent = [m for m in self.session.of(SendPhoto) if m.chat_id == CHANNEL][0]
         self.assertEqual(sent.caption, "Кот\n\n" + SIGNATURE)
 
+    async def test_preview(self):
+        self.configure()
+        await self.feed(press(f"p:prev:{CHANNEL}"))
+        sample = self.session.of(SendMessage)[-1]
+        self.assertEqual(sample.chat_id, ADMIN)
+        self.assertTrue(sample.text.endswith(SIGNATURE))
+        self.assertEqual(sample.reply_markup.inline_keyboard[0][0].url, "https://site.ru")
+
+    async def test_preview_after_saving_buttons(self):
+        await self.feed(press(f"p:btn:{CHANNEL}"))
+        await self.feed(private(text="Канал - @khinkaligames"))
+        samples = [m for m in self.session.of(SendMessage) if m.reply_markup and m.text.startswith("<i>Пример")]
+        self.assertEqual(samples[0].reply_markup.inline_keyboard[0][0].url, "https://t.me/khinkaligames")
+
     async def test_stranger_cannot_configure(self):
         await self.feed(press(f"p:sig:{CHANNEL}", user_id=STRANGER))
         answer = self.session.of(AnswerCallbackQuery)[-1]
