@@ -106,6 +106,14 @@ class ButtonsParsingTest(unittest.TestCase):
             [{"text": "YouTube", "url": "https://youtube.com/@me"}],
         ])
 
+    def test_telegram_username(self):
+        rows, _ = parse_buttons(
+            "Сайт - https://shapovalov.digital | Сервис ПФ - https://gopf.ru\n"
+            "FuryCRM - https://furycrm.ru | Khinkali Games - @khinkaligames"
+        )
+        self.assertEqual(rows[1][1], {"text": "Khinkali Games", "url": "https://t.me/khinkaligames"})
+        self.assertEqual(len(rows), 2)
+
     def test_bad(self):
         rows, bad = parse_buttons("Сайт https://site.ru")
         self.assertIsNone(rows)

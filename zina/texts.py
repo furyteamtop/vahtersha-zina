@@ -147,12 +147,14 @@ POSTER_SIGNATURE_TEXT_ONLY = "Подпись должна быть тексто�
 POSTER_ASK_BUTTONS = (
     "🔘 Пришлите кнопки. Каждая строка — ряд кнопок, кнопки в ряду через «|», "
     "название и ссылка через тире:\n\n"
-    "<code>Сайт - https://example.com | Чат - t.me/my_chat\n"
-    "YouTube - https://youtube.com/@my_channel</code>"
+    "<code>Сайт - https://example.com | Канал - @my_channel\n"
+    "YouTube - https://youtube.com/@my_channel</code>\n\n"
+    "Telegram-канал или чат можно указать просто через @."
 )
 POSTER_BUTTONS_BAD = (
     "Не разобрала кнопку: <code>{bad}</code>\n\n"
-    "Нужно так: <code>Название - https://ссылка</code>, кнопки в ряду через «|», ряды — с новой строки."
+    "Нужно так: <code>Название - https://ссылка</code> или <code>Название - @канал</code>, "
+    "кнопки в ряду через «|», ряды — с новой строки."
 )
 POSTER_ASK_POST = (
     "📝 Пришлите пост: текст, фото или видео с подписью, документ, голосовое. "

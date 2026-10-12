@@ -56,6 +56,7 @@ class Poster(StatesGroup):
 _TAG = re.compile(r"<[^>]+>")
 _BUTTON = re.compile(r"^\s*(.+?)\s+[-—–]\s+(\S+)\s*$")
 _URL = re.compile(r"^(https?://|tg://)\S+$", re.I)
+_USERNAME = re.compile(r"^@([A-Za-z0-9_]{4,32})$")
 _BARE_URL = re.compile(r"^(t\.me/|[\w-]+(\.[\w-]+)*\.[a-z]{2,}(/|$))\S*$", re.I)
 
 
@@ -75,7 +76,10 @@ def parse_buttons(text: str) -> Tuple[Optional[Buttons], str]:
             if not m:
                 return None, part.strip()
             label, url = m.group(1).strip(), m.group(2)
-            if not _URL.match(url):
+            username = _USERNAME.match(url)
+            if username:  # @channel -> ссылка на канал или чат
+                url = f"https://t.me/{username.group(1)}"
+            elif not _URL.match(url):
                 if not _BARE_URL.match(url):
                     return None, part.strip()
                 url = "https://" + url
