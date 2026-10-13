@@ -18,6 +18,7 @@ from aiogram.methods import (
     SendMessage,
     SendPhoto,
     SendSticker,
+    UnbanChatMember,
 )
 from aiogram.types import Message, Update
 
