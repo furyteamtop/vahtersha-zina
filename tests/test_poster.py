@@ -15,6 +15,7 @@ from aiogram.methods import (
     EditMessageReplyMarkup,
     EditMessageText,
     GetChat,
+    GetChatAdministrators,
     GetMe,
     GetChatMember,
     SendMessage,
@@ -29,6 +30,7 @@ from zina.poster import parse_buttons, router as poster_router
 from zina.storage import ChannelSettings, Memory, Storage
 
 CHANNEL = -1005
+GROUP = -1007  # группа обсуждений канала
 ADMIN = 10
 STRANGER = 30
 BOT_ID = 42
@@ -46,6 +48,8 @@ class FakeSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if isinstance(method, GetChatAdministrators):
+            return [SimpleNamespace(user=SimpleNamespace(id=ADMIN))]
         if isinstance(method, GetChatMember):
             if method.user_id in (ADMIN, BOT_ID):
                 return SimpleNamespace(status="administrator", can_post_messages=True, can_edit_messages=True)
@@ -57,10 +61,13 @@ class FakeSession(BaseSession):
                                    linked_chat_id=self.linked_chat_id)
         if isinstance(method, (SendMessage, SendPhoto)):
             chat_type = "channel" if method.chat_id == CHANNEL else "private"
-            return Message.model_validate({
+            sent = Message.model_validate({
                 "message_id": next(_ids), "date": int(time.time()),
                 "chat": {"id": method.chat_id, "type": chat_type, "username": "mychan"}, "text": "x",
             })
+            if method.chat_id == CHANNEL:
+                self.last_channel_post = sent.message_id
+            return sent
         return True
 
     async def close(self):
@@ -75,9 +82,32 @@ class FakeSession(BaseSession):
 
 def channel_post(**fields):
     msg = {"message_id": next(_ids), "date": int(time.time()),
-           "chat": {"id": CHANNEL, "type": "channel", "title": "Мой канал"}}
+           "chat": {"id": CHANNEL, "type": "channel", "title": "Мой канал", "username": "mychan"}}
     msg.update(fields)
     return Update.model_validate({"update_id": next(_ids), "channel_post": msg})
+
+
+def discussion_copy(post_id, root_id):
+    """Копия поста канала, которую Telegram пересылает в группу обсуждений."""
+    return Update.model_validate({"update_id": next(_ids), "message": {
+        "message_id": root_id, "date": int(time.time()),
+        "chat": {"id": GROUP, "type": "supergroup"},
+        "from": {"id": 777000, "is_bot": False, "first_name": "Telegram"},
+        "sender_chat": {"id": CHANNEL, "type": "channel", "title": "Мой канал", "username": "mychan"},
+        "is_automatic_forward": True, "text": "Пост",
+        "forward_origin": {"type": "channel", "message_id": post_id, "date": int(time.time()),
+                           "chat": {"id": CHANNEL, "type": "channel", "title": "Мой канал", "username": "mychan"}},
+    }})
+
+
+def group_comment(reply_to, user_id=ADMIN):
+    return Update.model_validate({"update_id": next(_ids), "message": {
+        "message_id": next(_ids), "date": int(time.time()),
+        "chat": {"id": GROUP, "type": "supergroup"},
+        "from": {"id": user_id, "is_bot": False, "first_name": "Админ"},
+        "text": "Комментарий", "message_thread_id": reply_to.message_id,
+        "reply_to_message": reply_to.model_dump(exclude_none=True),
+    }})
 
 
 def private(user_id=ADMIN, **fields):
@@ -270,40 +300,63 @@ class PosterTest(unittest.IsolatedAsyncioTestCase):
 
     # --- кнопка «Комментарии» ---
 
-    async def test_comments_button_added_when_channel_has_discussion(self):
-        self.session.linked_chat_id = -1007
+    async def test_comments_button_added_when_copy_arrives(self):
+        self.session.linked_chat_id = GROUP
         self.configure()
         post = channel_post(text="Пост")
         await self.feed(post)
+        post_id = post.channel_post.message_id
         rows = self.session.of(EditMessageText)[0].reply_markup.inline_keyboard
-        self.assertEqual(rows[-1][0].text, "💬 Комментарии")
-        self.assertEqual(rows[-1][0].url, f"https://t.me/mychan/{post.channel_post.message_id}?comment=1")
+        self.assertEqual(len(rows), 1)  # ветка ещё неизвестна — пока без «Комментариев»
+
+        await self.feed(discussion_copy(post_id, root_id=900))
+        edit = self.session.of(EditMessageReplyMarkup)[-1]
+        self.assertEqual((edit.chat_id, edit.message_id), (CHANNEL, post_id))
+        self.assertEqual(edit.reply_markup.inline_keyboard[-1][0].text, "💬 Комментарии")
+        self.assertEqual(edit.reply_markup.inline_keyboard[-1][0].url, f"https://t.me/mychan/{post_id}?comment=900")
+
+    async def test_copy_before_post_gives_single_edit(self):
+        self.session.linked_chat_id = GROUP
+        self.configure()
+        post = channel_post(text="Пост")
+        await self.feed(discussion_copy(post.channel_post.message_id, root_id=901))
+        await self.feed(post)
+        rows = self.session.of(EditMessageText)[0].reply_markup.inline_keyboard
+        self.assertTrue(rows[-1][0].url.endswith("?comment=901"))
+        self.assertEqual(self.session.of(EditMessageReplyMarkup), [])
+
+    async def test_comment_reveals_thread(self):
+        self.session.linked_chat_id = GROUP
+        self.configure()
+        post = channel_post(text="Пост")
+        await self.feed(post)
+        # копию Зина пропустила, но в комментарии видно, к какому посту он относится
+        await self.feed(group_comment(reply_to=discussion_copy(post.channel_post.message_id, 902).message))
+        self.assertTrue(self.session.of(EditMessageReplyMarkup)[-1].reply_markup
+                        .inline_keyboard[-1][0].url.endswith("?comment=902"))
 
     async def test_comments_button_can_be_disabled(self):
-        self.session.linked_chat_id = -1007
+        self.session.linked_chat_id = GROUP
         self.store.save_channel(CHANNEL, ChannelSettings(SIGNATURE, BUTTONS, True, comments=False))
-        await self.feed(channel_post(text="Пост"))
-        rows = self.session.of(EditMessageText)[0].reply_markup.inline_keyboard
-        self.assertEqual(len(rows), 1)
-
-    async def test_no_comments_button_without_buttons(self):
-        self.session.linked_chat_id = -1007
-        self.configure(buttons=[])
-        await self.feed(channel_post(text="Пост"))
-        self.assertIsNone(self.session.of(EditMessageText)[0].reply_markup)
+        post = channel_post(text="Пост")
+        await self.feed(post)
+        await self.feed(discussion_copy(post.channel_post.message_id, root_id=903))
+        self.assertEqual(len(self.session.of(EditMessageText)[0].reply_markup.inline_keyboard), 1)
+        self.assertEqual(self.session.of(EditMessageReplyMarkup), [])
 
     async def test_published_post_gets_comments_button(self):
-        self.session.linked_chat_id = -1007
+        self.session.linked_chat_id = GROUP
         self.configure()
         await self.feed(press(f"p:new:{CHANNEL}"))
         await self.feed(private(text="Пост через Зину"))
         preview = [m for m in self.session.of(SendMessage) if m.chat_id == ADMIN and "Пост через Зину" in m.text][0]
         self.assertEqual(preview.reply_markup.inline_keyboard[-1][0].text, "💬 Комментарии")
         await self.feed(press(f"p:pub:{CHANNEL}"))
+        post_id = self.session.last_channel_post
+        await self.feed(discussion_copy(post_id, root_id=904))
         edit = self.session.of(EditMessageReplyMarkup)[-1]
-        self.assertEqual(edit.chat_id, CHANNEL)
-        self.assertEqual(edit.reply_markup.inline_keyboard[-1][0].url,
-                         f"https://t.me/mychan/{edit.message_id}?comment=1")
+        self.assertEqual((edit.chat_id, edit.message_id), (CHANNEL, post_id))
+        self.assertEqual(edit.reply_markup.inline_keyboard[-1][0].url, f"https://t.me/mychan/{post_id}?comment=904")
 
     async def test_old_database_is_upgraded(self):
         import sqlite3

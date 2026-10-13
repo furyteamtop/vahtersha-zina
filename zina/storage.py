@@ -155,6 +155,15 @@ class Memory:
         self.drafts: Dict[int, Tuple[int, "Message"]] = {}  # user_id -> (канал, черновик поста)
         self.user_channels: Dict[int, List[int]] = {}  # недавние каналы админа — для быстрого выбора
         self.albums: Dict[str, Album] = {}  # альбомы, которые сейчас подписываются
+        # (канал, пост) -> номер копии поста в группе обсуждений, корень ветки комментариев
+        self.thread_roots: Dict[Key, int] = {}
+        # посты с нашими кнопками, ждущие кнопку «Комментарии»: (канал, пост) -> (чат канала, кнопки)
+        self.awaiting_comments: Dict[Key, Tuple[object, list]] = {}
+
+    def trim_threads(self, limit: int = 2000) -> None:
+        for d in (self.thread_roots, self.awaiting_comments):
+            for old in list(d)[: max(0, len(d) - limit)]:
+                del d[old]
 
     def remember_channel(self, user_id: int, chat_id: int) -> None:
         recent = [c for c in self.user_channels.get(user_id, []) if c != chat_id]

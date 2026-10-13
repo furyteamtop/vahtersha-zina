@@ -21,7 +21,7 @@ from aiogram.types import (
     User,
 )
 
-from . import captcha, spam, texts
+from . import captcha, poster, spam, texts
 from .config import Config
 from .storage import Key, Memory, Pending, Storage
 
@@ -345,7 +345,11 @@ async def check_message(
 ) -> None:
     chat_id = message.chat.id
     if message.is_automatic_forward:
-        return  # пост канала, пересланный в обсуждение
+        # пост канала, пересланный в обсуждение: запоминаем, где ветка его комментариев
+        await poster.learn_thread_root(bot, mem, store, message)
+        return
+    if message.reply_to_message and message.reply_to_message.is_automatic_forward:
+        await poster.learn_thread_root(bot, mem, store, message.reply_to_message)
     settings = store.get(chat_id)
     stats = mem.stat(chat_id)
     text = text_of(message)

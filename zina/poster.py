@@ -202,25 +202,77 @@ def post_link(chat, message_id: Optional[int] = None) -> str:
     return f"{base}/{message_id}" if message_id else base
 
 
-async def comments_url(bot: Bot, settings: ChannelSettings, channel_id: int,
-                       message_id: Optional[int]) -> Optional[str]:
-    """Ссылка, открывающая комментарии к посту. None — если кнопка выключена или обсуждения нет.
-    Без message_id — ссылка на канал (для предпросмотра, пока поста ещё нет)."""
+async def preview_comments_url(bot: Bot, settings: ChannelSettings, channel_id: int) -> Optional[str]:
+    """Кнопка «Комментарии» для предпросмотра: поста ещё нет, поэтому ведёт просто на канал."""
     if not settings.comments or not settings.buttons:
         return None
     chat = await get_channel(bot, channel_id)
     if chat is None or not getattr(chat, "linked_chat_id", None):
         return None
-    return f"{post_link(chat, message_id)}?comment=1" if message_id else post_link(chat)
+    return post_link(chat)
+
+
+# ---------- кнопка «Комментарии» ----------
+#
+# Комментарии к посту — это ветка в группе обсуждений, растущая из копии поста, которую
+# Telegram сам пересылает туда при публикации. Ссылка «пост?comment=<номер копии>» открывает
+# эту ветку. Номер копии Зина узнаёт, когда копия приходит в группу (или из любого комментария),
+# поэтому кнопка добавляется вторым шагом: правка одних кнопок не даёт пометку «изменено».
+
+def comments_link(channel_chat, post_id: int, root_id: int) -> str:
+    return f"{post_link(channel_chat, post_id)}?comment={root_id}"
+
+
+async def attach_comments(bot: Bot, channel_chat, post_id: int, buttons: Buttons, root_id: int) -> None:
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=channel_chat.id, message_id=post_id,
+            reply_markup=keyboard(buttons, comments_link(channel_chat, post_id, root_id)),
+        )
+    except TelegramAPIError as e:
+        log.warning("Не удалось добавить кнопку комментариев: %s", e.message)
+
+
+async def after_buttons(bot: Bot, mem: Memory, settings: ChannelSettings, channel_chat, post_id: int) -> None:
+    """Пост получил наши кнопки — добавить к ним «Комментарии», как только узнаем ветку."""
+    if not settings.comments or not settings.buttons:
+        return
+    key = (channel_chat.id, post_id)
+    root = mem.thread_roots.get(key)
+    if root is None:
+        mem.awaiting_comments[key] = (channel_chat, settings.buttons)  # допишем, когда придёт копия
+        mem.trim_threads()
+        return
+    await attach_comments(bot, channel_chat, post_id, settings.buttons, root)
+
+
+async def learn_thread_root(bot: Bot, mem: Memory, store: Storage, root: Message) -> None:
+    """В группу обсуждений пришла копия поста канала (или комментарий к ней) — запоминаем ветку."""
+    origin = root.forward_origin
+    if not isinstance(origin, MessageOriginChannel):
+        return
+    key = (origin.chat.id, origin.message_id)
+    if mem.thread_roots.get(key) == root.message_id:
+        return
+    mem.thread_roots[key] = root.message_id
+    mem.trim_threads()
+    log.info("Ветка комментариев: пост %s → копия %s", origin.message_id, root.message_id)
+    waiting = mem.awaiting_comments.pop(key, None)
+    if waiting and store.channel(origin.chat.id).comments:
+        channel_chat, buttons = waiting
+        await attach_comments(bot, channel_chat, origin.message_id, buttons, root.message_id)
 
 
 # ---------- автоподпись постов в канале ----------
 
-async def sign_post(bot: Bot, message: Message, settings: ChannelSettings, with_buttons: bool = True) -> None:
+async def sign_post(bot: Bot, mem: Memory, message: Message, settings: ChannelSettings,
+                    with_buttons: bool = True) -> None:
     body, fitted = signed_body(message, settings.signature)
     markup = message.reply_markup
-    if markup is None and with_buttons:
-        url = await comments_url(bot, settings, message.chat.id, message.message_id)
+    ours = markup is None and with_buttons and bool(settings.buttons)
+    root = mem.thread_roots.get((message.chat.id, message.message_id))
+    if ours:
+        url = comments_link(message.chat, message.message_id, root) if (root and settings.comments) else None
         markup = keyboard(settings.buttons, url)
     text_changed = fitted and body != body_html(message)
     chat_id, message_id = message.chat.id, message.message_id
@@ -240,6 +292,9 @@ async def sign_post(bot: Bot, message: Message, settings: ChannelSettings, with_
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=markup)
     except TelegramAPIError as e:
         log.warning("Не удалось подписать пост: %s", e.message)
+        return
+    if ours and not root:
+        await after_buttons(bot, mem, settings, message.chat, message.message_id)
 
 
 async def finish_album(bot: Bot, mem: Memory, group_id: str, settings: ChannelSettings) -> None:
@@ -247,7 +302,7 @@ async def finish_album(bot: Bot, mem: Memory, group_id: str, settings: ChannelSe
     album = mem.albums.pop(group_id, None)
     if album and not album.done and album.items:
         # ни у одного фото нет подписи — добавляем её к первому
-        await sign_post(bot, min(album.items, key=lambda m: m.message_id), settings, with_buttons=False)
+        await sign_post(bot, mem, min(album.items, key=lambda m: m.message_id), settings, with_buttons=False)
 
 
 @router.channel_post()
@@ -258,7 +313,7 @@ async def on_channel_post(message: Message, bot: Bot, mem: Memory, store: Storag
     if message.forward_origin or message.via_bot:
         return  # чужие пересланные посты не трогаем
     if not message.media_group_id:
-        await sign_post(bot, message, settings)
+        await sign_post(bot, mem, message, settings)
         return
     # Альбом приходит отдельными сообщениями. Кнопки к альбому прикрепить нельзя — только подпись.
     album = mem.albums.get(message.media_group_id)
@@ -269,7 +324,7 @@ async def on_channel_post(message: Message, bot: Bot, mem: Memory, store: Storag
         return
     if message.caption:
         album.done = True
-        await sign_post(bot, message, settings, with_buttons=False)
+        await sign_post(bot, mem, message, settings, with_buttons=False)
     else:
         album.items.append(message)
 
@@ -350,7 +405,7 @@ async def send_sample(bot: Bot, chat_id: int, channel_id: int, s: ChannelSetting
         return
     text = texts.POSTER_SAMPLE + (f"\n\n{s.signature}" if s.signature else "")
     await bot.send_message(
-        chat_id, text, reply_markup=keyboard(s.buttons, await comments_url(bot, s, channel_id, None)),
+        chat_id, text, reply_markup=keyboard(s.buttons, await preview_comments_url(bot, s, channel_id)),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -532,7 +587,7 @@ async def got_post(message: Message, bot: Bot, mem: Memory, store: Storage, stat
     s = store.channel(channel_id)
     try:
         preview, fitted = compose(message, s, message.chat.id,
-                                  comments_url=await comments_url(bot, s, channel_id, None))
+                                  comments_url=await preview_comments_url(bot, s, channel_id))
     except TypeError:
         await message.answer(texts.POSTER_UNSUPPORTED)
         return
@@ -561,16 +616,8 @@ async def publish(cb: CallbackQuery, bot: Bot, mem: Memory, store: Storage, stat
     except TelegramAPIError as e:
         await cb.answer(f"Не получилось: {e.message}", show_alert=True)
         return
-    # Ссылка на комментарии зависит от номера поста, он известен только после публикации.
-    # Правка одних кнопок не даёт пометку «изменено».
-    url = await comments_url(bot, settings, channel_id, sent.message_id)
-    if url and "reply_markup" in type(method).model_fields:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=channel_id, message_id=sent.message_id, reply_markup=keyboard(settings.buttons, url)
-            )
-        except TelegramAPIError as e:
-            log.warning("Не удалось добавить кнопку комментариев: %s", e.message)
+    if "reply_markup" in type(method).model_fields:
+        await after_buttons(bot, mem, settings, sent.chat, sent.message_id)
     mem.drafts.pop(cb.from_user.id, None)
     await state.clear()
     await cb.answer("Опубликовала ✅")
