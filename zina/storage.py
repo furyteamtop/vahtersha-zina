@@ -40,6 +40,7 @@ class ChannelSettings:
     signature: str = ""  # HTML, дописывается в конец поста
     buttons: Buttons = field(default_factory=list)
     auto: bool = True  # дописывать к постам, опубликованным прямо в канале
+    comments: bool = True  # своя кнопка «Комментарии»: у постов с кнопками Telegram прячет свою
 
 
 class Storage:
@@ -59,6 +60,10 @@ class Storage:
             " buttons TEXT NOT NULL DEFAULT '[]',"
             " auto INTEGER NOT NULL DEFAULT 1)"
         )
+        try:  # колонка добавлена позже — докидываем в старые базы
+            self._db.execute("ALTER TABLE channels ADD COLUMN comments INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
         self._db.commit()
         self._cache: Dict[int, ChatSettings] = {}
         self._channels: Dict[int, ChannelSettings] = {}
@@ -66,18 +71,19 @@ class Storage:
     def channel(self, chat_id: int) -> ChannelSettings:
         if chat_id not in self._channels:
             row = self._db.execute(
-                "SELECT signature, buttons, auto FROM channels WHERE chat_id = ?", (chat_id,)
+                "SELECT signature, buttons, auto, comments FROM channels WHERE chat_id = ?", (chat_id,)
             ).fetchone()
             self._channels[chat_id] = (
-                ChannelSettings(row[0], json.loads(row[1]), bool(row[2])) if row else ChannelSettings()
+                ChannelSettings(row[0], json.loads(row[1]), bool(row[2]), bool(row[3])) if row else ChannelSettings()
             )
         return self._channels[chat_id]
 
     def save_channel(self, chat_id: int, settings: ChannelSettings) -> None:
         self._channels[chat_id] = settings
         self._db.execute(
-            "INSERT OR REPLACE INTO channels (chat_id, signature, buttons, auto) VALUES (?, ?, ?, ?)",
-            (chat_id, settings.signature, json.dumps(settings.buttons, ensure_ascii=False), int(settings.auto)),
+            "INSERT OR REPLACE INTO channels (chat_id, signature, buttons, auto, comments) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, settings.signature, json.dumps(settings.buttons, ensure_ascii=False),
+             int(settings.auto), int(settings.comments)),
         )
         self._db.commit()
 

@@ -42,6 +42,7 @@ class FakeSession(BaseSession):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.linked_chat_id = None  # группа обсуждений канала
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
@@ -52,7 +53,8 @@ class FakeSession(BaseSession):
         if isinstance(method, GetMe):
             return SimpleNamespace(id=BOT_ID, username="vahtershazina_bot")
         if isinstance(method, GetChat):
-            return SimpleNamespace(id=CHANNEL, title="Мой канал", username="mychan", type="channel")
+            return SimpleNamespace(id=CHANNEL, title="Мой канал", username="mychan", type="channel",
+                                   linked_chat_id=self.linked_chat_id)
         if isinstance(method, (SendMessage, SendPhoto)):
             chat_type = "channel" if method.chat_id == CHANNEL else "private"
             return Message.model_validate({
@@ -265,6 +267,55 @@ class PosterTest(unittest.IsolatedAsyncioTestCase):
         await self.feed(private(text="Канал - @khinkaligames"))
         samples = [m for m in self.session.of(SendMessage) if m.reply_markup and m.text.startswith("<i>Пример")]
         self.assertEqual(samples[0].reply_markup.inline_keyboard[0][0].url, "https://t.me/khinkaligames")
+
+    # --- кнопка «Комментарии» ---
+
+    async def test_comments_button_added_when_channel_has_discussion(self):
+        self.session.linked_chat_id = -1007
+        self.configure()
+        post = channel_post(text="Пост")
+        await self.feed(post)
+        rows = self.session.of(EditMessageText)[0].reply_markup.inline_keyboard
+        self.assertEqual(rows[-1][0].text, "💬 Комментарии")
+        self.assertEqual(rows[-1][0].url, f"https://t.me/mychan/{post.channel_post.message_id}?comment=1")
+
+    async def test_comments_button_can_be_disabled(self):
+        self.session.linked_chat_id = -1007
+        self.store.save_channel(CHANNEL, ChannelSettings(SIGNATURE, BUTTONS, True, comments=False))
+        await self.feed(channel_post(text="Пост"))
+        rows = self.session.of(EditMessageText)[0].reply_markup.inline_keyboard
+        self.assertEqual(len(rows), 1)
+
+    async def test_no_comments_button_without_buttons(self):
+        self.session.linked_chat_id = -1007
+        self.configure(buttons=[])
+        await self.feed(channel_post(text="Пост"))
+        self.assertIsNone(self.session.of(EditMessageText)[0].reply_markup)
+
+    async def test_published_post_gets_comments_button(self):
+        self.session.linked_chat_id = -1007
+        self.configure()
+        await self.feed(press(f"p:new:{CHANNEL}"))
+        await self.feed(private(text="Пост через Зину"))
+        preview = [m for m in self.session.of(SendMessage) if m.chat_id == ADMIN and "Пост через Зину" in m.text][0]
+        self.assertEqual(preview.reply_markup.inline_keyboard[-1][0].text, "💬 Комментарии")
+        await self.feed(press(f"p:pub:{CHANNEL}"))
+        edit = self.session.of(EditMessageReplyMarkup)[-1]
+        self.assertEqual(edit.chat_id, CHANNEL)
+        self.assertEqual(edit.reply_markup.inline_keyboard[-1][0].url,
+                         f"https://t.me/mychan/{edit.message_id}?comment=1")
+
+    async def test_old_database_is_upgraded(self):
+        import sqlite3
+        path = f"{self.tmp.name}/old.db"
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE channels (chat_id INTEGER PRIMARY KEY, signature TEXT NOT NULL DEFAULT '',"
+                   " buttons TEXT NOT NULL DEFAULT '[]', auto INTEGER NOT NULL DEFAULT 1)")
+        db.execute("INSERT INTO channels VALUES (?, 'подпись', '[]', 0)", (CHANNEL,))
+        db.commit()
+        db.close()
+        s = Storage(path).channel(CHANNEL)
+        self.assertEqual((s.signature, s.auto, s.comments), ("подпись", False, True))
 
     async def test_stranger_cannot_configure(self):
         await self.feed(press(f"p:sig:{CHANNEL}", user_id=STRANGER))

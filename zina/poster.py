@@ -88,12 +88,17 @@ def parse_buttons(text: str) -> Tuple[Optional[Buttons], str]:
     return (rows[:10] or None), ""
 
 
-def keyboard(buttons: Buttons) -> Optional[InlineKeyboardMarkup]:
+COMMENTS_BUTTON = "💬 Комментарии"
+
+
+def keyboard(buttons: Buttons, comments_url: Optional[str] = None) -> Optional[InlineKeyboardMarkup]:
+    """Кнопки поста. comments_url — добавить последним рядом кнопку «Комментарии»."""
     if not buttons:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row] for row in buttons]
-    )
+        return None  # без кнопок Telegram сам показывает панель комментариев
+    rows = [[InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row] for row in buttons]
+    if comments_url:
+        rows.append([InlineKeyboardButton(text=COMMENTS_BUTTON, url=comments_url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def has_body_slot(message: Message) -> bool:
@@ -141,7 +146,8 @@ def preview_options(message: Message) -> LinkPreviewOptions:
     return LinkPreviewOptions(is_disabled=True)
 
 
-def compose(message: Message, settings: ChannelSettings, chat_id: int, with_buttons: bool = True):
+def compose(message: Message, settings: ChannelSettings, chat_id: int, with_buttons: bool = True,
+            comments_url: Optional[str] = None):
     """Метод отправки копии поста с подписью и кнопками. Возвращает (метод, поместилась ли подпись)."""
     copy = message.send_copy(chat_id, parse_mode=ParseMode.HTML)
     body, fitted = signed_body(message, settings.signature)
@@ -151,7 +157,7 @@ def compose(message: Message, settings: ChannelSettings, chat_id: int, with_butt
         update.update(text=body, entities=None, link_preview_options=preview_options(message))
     elif "caption" in fields:
         update.update(caption=body or None, caption_entities=None)
-    markup = keyboard(settings.buttons) if with_buttons else None
+    markup = keyboard(settings.buttons, comments_url) if with_buttons else None
     if markup and "reply_markup" in fields:
         update["reply_markup"] = markup
     return copy.model_copy(update=update), fitted
@@ -178,24 +184,44 @@ async def check_access(bot: Bot, channel_id: int, user_id: int) -> Tuple[Optiona
     return None, warnings
 
 
-async def channel_title(bot: Bot, channel_id: int) -> str:
+async def get_channel(bot: Bot, channel_id: int):
     try:
-        return (await bot.get_chat(channel_id)).title or "канал"
+        return await bot.get_chat(channel_id)
     except TelegramAPIError:
-        return "канал"
+        return None
 
 
-def post_link(chat, message_id: int) -> str:
-    if getattr(chat, "username", None):
-        return f"https://t.me/{chat.username}/{message_id}"
-    return f"https://t.me/c/{str(chat.id).replace('-100', '', 1)}/{message_id}"
+async def channel_title(bot: Bot, channel_id: int) -> str:
+    chat = await get_channel(bot, channel_id)
+    return (chat.title if chat else None) or "канал"
+
+
+def post_link(chat, message_id: Optional[int] = None) -> str:
+    base = (f"https://t.me/{chat.username}" if getattr(chat, "username", None)
+            else f"https://t.me/c/{str(chat.id).replace('-100', '', 1)}")
+    return f"{base}/{message_id}" if message_id else base
+
+
+async def comments_url(bot: Bot, settings: ChannelSettings, channel_id: int,
+                       message_id: Optional[int]) -> Optional[str]:
+    """Ссылка, открывающая комментарии к посту. None — если кнопка выключена или обсуждения нет.
+    Без message_id — ссылка на канал (для предпросмотра, пока поста ещё нет)."""
+    if not settings.comments or not settings.buttons:
+        return None
+    chat = await get_channel(bot, channel_id)
+    if chat is None or not getattr(chat, "linked_chat_id", None):
+        return None
+    return f"{post_link(chat, message_id)}?comment=1" if message_id else post_link(chat)
 
 
 # ---------- автоподпись постов в канале ----------
 
 async def sign_post(bot: Bot, message: Message, settings: ChannelSettings, with_buttons: bool = True) -> None:
     body, fitted = signed_body(message, settings.signature)
-    markup = message.reply_markup or (keyboard(settings.buttons) if with_buttons else None)
+    markup = message.reply_markup
+    if markup is None and with_buttons:
+        url = await comments_url(bot, settings, message.chat.id, message.message_id)
+        markup = keyboard(settings.buttons, url)
     text_changed = fitted and body != body_html(message)
     chat_id, message_id = message.chat.id, message.message_id
     try:
@@ -285,6 +311,9 @@ def menu_markup(channel_id: int, s: ChannelSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"🤖 Автоподпись: {'вкл' if s.auto else 'выкл'}", callback_data=f"p:auto:{channel_id}"
         )],
+        [InlineKeyboardButton(
+            text=f"💬 Кнопка «Комментарии»: {'вкл' if s.comments else 'выкл'}", callback_data=f"p:comm:{channel_id}"
+        )],
         [
             InlineKeyboardButton(text="👁 Предпросмотр", callback_data=f"p:prev:{channel_id}"),
             InlineKeyboardButton(text="📝 Новый пост", callback_data=f"p:new:{channel_id}"),
@@ -309,18 +338,19 @@ def menu_text(title: str, s: ChannelSettings, warnings: List[str]) -> str:
         signature=s.signature or "<i>не задана</i>",
         buttons=buttons or "<i>нет</i>",
         auto=texts.POSTER_AUTO_ON if s.auto else texts.POSTER_AUTO_OFF,
+        comments=texts.POSTER_COMMENTS_ON if s.comments else texts.POSTER_COMMENTS_OFF,
         warnings=("\n\n" + "\n".join(f"⚠️ {w}" for w in warnings)) if warnings else "",
     )
 
 
-async def send_sample(bot: Bot, chat_id: int, s: ChannelSettings) -> None:
+async def send_sample(bot: Bot, chat_id: int, channel_id: int, s: ChannelSettings) -> None:
     """Пример поста с текущей подписью и кнопками — как он будет выглядеть в канале."""
     if not (s.signature or s.buttons):
         await bot.send_message(chat_id, texts.POSTER_SAMPLE_EMPTY)
         return
     text = texts.POSTER_SAMPLE + (f"\n\n{s.signature}" if s.signature else "")
     await bot.send_message(
-        chat_id, text, reply_markup=keyboard(s.buttons),
+        chat_id, text, reply_markup=keyboard(s.buttons, await comments_url(bot, s, channel_id, None)),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -404,7 +434,12 @@ async def on_menu(cb: CallbackQuery, bot: Bot, mem: Memory, store: Storage, stat
         await show_menu(bot, store, chat_id, channel_id, warnings)
     elif action == "prev":
         await cb.answer()
-        await send_sample(bot, chat_id, s)
+        await send_sample(bot, chat_id, channel_id, s)
+    elif action == "comm":
+        s.comments = not s.comments
+        store.save_channel(channel_id, s)
+        await cb.answer("Кнопка «Комментарии» включена" if s.comments else "Кнопка «Комментарии» выключена")
+        await show_menu(bot, store, chat_id, channel_id, warnings, edit=cb.message)
     elif action == "auto":
         s.auto = not s.auto
         store.save_channel(channel_id, s)
@@ -458,7 +493,7 @@ async def got_signature(message: Message, bot: Bot, store: Storage, state: FSMCo
     store.save_channel(channel_id, s)
     await state.clear()
     await message.answer("Подпись сохранила ✅ Вот как будет выглядеть пост:")
-    await send_sample(bot, message.chat.id, s)
+    await send_sample(bot, message.chat.id, channel_id, s)
     await show_menu(bot, store, message.chat.id, channel_id, warnings)
 
 
@@ -478,7 +513,7 @@ async def got_buttons(message: Message, bot: Bot, store: Storage, state: FSMCont
     store.save_channel(channel_id, s)
     await state.clear()
     await message.answer("Кнопки сохранила ✅ Вот как будет выглядеть пост:")
-    await send_sample(bot, message.chat.id, s)
+    await send_sample(bot, message.chat.id, channel_id, s)
     await show_menu(bot, store, message.chat.id, channel_id, warnings)
 
 
@@ -496,7 +531,8 @@ async def got_post(message: Message, bot: Bot, mem: Memory, store: Storage, stat
         return
     s = store.channel(channel_id)
     try:
-        preview, fitted = compose(message, s, message.chat.id)
+        preview, fitted = compose(message, s, message.chat.id,
+                                  comments_url=await comments_url(bot, s, channel_id, None))
     except TypeError:
         await message.answer(texts.POSTER_UNSUPPORTED)
         return
@@ -518,12 +554,23 @@ async def publish(cb: CallbackQuery, bot: Bot, mem: Memory, store: Storage, stat
     if draft is None or draft[0] != channel_id:
         await cb.answer("Черновик не найден — пришлите пост ещё раз.", show_alert=True)
         return
-    method, _ = compose(draft[1], store.channel(channel_id), channel_id)
+    settings = store.channel(channel_id)
+    method, _ = compose(draft[1], settings, channel_id)
     try:
         sent = await bot(method)
     except TelegramAPIError as e:
         await cb.answer(f"Не получилось: {e.message}", show_alert=True)
         return
+    # Ссылка на комментарии зависит от номера поста, он известен только после публикации.
+    # Правка одних кнопок не даёт пометку «изменено».
+    url = await comments_url(bot, settings, channel_id, sent.message_id)
+    if url and "reply_markup" in type(method).model_fields:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=channel_id, message_id=sent.message_id, reply_markup=keyboard(settings.buttons, url)
+            )
+        except TelegramAPIError as e:
+            log.warning("Не удалось добавить кнопку комментариев: %s", e.message)
     mem.drafts.pop(cb.from_user.id, None)
     await state.clear()
     await cb.answer("Опубликовала ✅")
