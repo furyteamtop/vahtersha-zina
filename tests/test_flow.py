@@ -255,6 +255,30 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bans[0].until_date)
         self.assertEqual(self.reposts(), [])
 
+    async def test_unban_list_and_button(self):
+        await self.feed(comment("Привет"))
+        p = self.captcha()
+        await self.feed(press(USER, f"z:{USER}:{(p.correct + 1) % 3}", p.message_id))  # ошибся -> бан
+
+        await self.feed(comment("/unban", user_id=ADMIN))
+        listing = self.session.of(SendMessage)[-1]
+        button = listing.reply_markup.inline_keyboard[0][0]
+        self.assertIn("Кто-то", button.text)  # имя того, кто ошибся с ответом
+        self.assertEqual(button.callback_data, f"u:{USER}")
+
+        await self.feed(press(USER, f"u:{USER}", 555))  # не админ — нельзя
+        self.assertEqual(self.session.of(UnbanChatMember), [])
+
+        await self.feed(press(ADMIN, f"u:{USER}", 555))
+        unban = self.session.of(UnbanChatMember)[0]
+        self.assertEqual((unban.chat_id, unban.user_id, unban.only_if_banned), (GROUP, USER, True))
+        self.assertEqual(self.mem.active_bans(GROUP), {})
+
+    async def test_expired_bans_are_hidden(self):
+        self.mem.record_ban(GROUP, USER, "Вася", int(time.time()) - 1)
+        self.mem.record_ban(GROUP, 30, "Спамер", None)
+        self.assertEqual(list(self.mem.active_bans(GROUP)), [30])
+
     async def test_answers_callback(self):
         await self.feed(comment("Привет"))
         p = self.captcha()

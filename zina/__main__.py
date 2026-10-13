@@ -44,6 +44,7 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="zina", description="Статус охраны"),
+            BotCommand(command="unban", description="Снять бан с тех, кого не пустила Зина"),
             BotCommand(command="addword", description="Добавить стоп-слова через запятую"),
             BotCommand(command="delword", description="Убрать стоп-слова"),
             BotCommand(command="words", description="Список стоп-слов"),

@@ -149,6 +149,8 @@ class Memory:
         self.verified: Dict[Key, None] = {}  # dict как упорядоченное множество
         self.pending: Dict[Key, Pending] = {}
         self.stats: Dict[int, ChatStats] = {}
+        # кого Зина забанила: chat_id -> {user_id: (имя, до какого времени или None)}. Только для /unban.
+        self.bans: Dict[int, Dict[int, Tuple[str, Optional[int]]]] = {}
         self._admins: Dict[int, Tuple[float, Set[int]]] = {}
         self._linked: Dict[int, Tuple[float, Optional[int]]] = {}
         # постер
@@ -179,6 +181,24 @@ class Memory:
             for old in list(self.verified)[: self.VERIFIED_LIMIT // 10]:
                 del self.verified[old]
 
+    def record_ban(self, chat_id: int, user_id: int, name: str, until: Optional[int]) -> None:
+        bans = self.bans.setdefault(chat_id, {})
+        bans.pop(user_id, None)
+        bans[user_id] = (name or "Без имени", until)
+        for old in list(bans)[:-30]:
+            del bans[old]
+
+    def active_bans(self, chat_id: int) -> Dict[int, Tuple[str, Optional[int]]]:
+        bans = self.bans.get(chat_id, {})
+        now = time.time()
+        for user_id in [u for u, (_, until) in bans.items() if until is not None and until <= now]:
+            del bans[user_id]  # временный бан уже закончился
+        return bans
+
+    def forget_ban(self, chat_id: int, user_id: int) -> Optional[str]:
+        entry = self.bans.get(chat_id, {}).pop(user_id, None)
+        return entry[0] if entry else None
+
     def stat(self, chat_id: int) -> ChatStats:
         return self.stats.setdefault(chat_id, ChatStats())
 
@@ -206,5 +226,6 @@ class Memory:
             if p.task:
                 p.task.cancel()
         self.stats.pop(chat_id, None)
+        self.bans.pop(chat_id, None)
         self._admins.pop(chat_id, None)
         self._linked.pop(chat_id, None)

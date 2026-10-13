@@ -85,23 +85,21 @@ class IsAdmin(Filter):
         return await is_admin_message(message, bot, mem)
 
 
-async def punish(bot: Bot, cfg: Config, chat_id: int, user_id: int) -> None:
+async def punish(bot: Bot, cfg: Config, mem: Memory, chat_id: int, user_id: int, name: str) -> None:
     if cfg.fail_ban_minutes <= 0:
         return
+    until = int(time.time()) + cfg.fail_ban_minutes * 60
     try:
-        await bot.ban_chat_member(
-            chat_id,
-            user_id,
-            until_date=int(time.time()) + cfg.fail_ban_minutes * 60,
-            revoke_messages=True,
-        )
+        await bot.ban_chat_member(chat_id, user_id, until_date=until, revoke_messages=True)
+        mem.record_ban(chat_id, user_id, name, until)
     except TelegramAPIError:
         pass
 
 
-async def ban_forever(bot: Bot, chat_id: int, user_id: int) -> None:
+async def ban_forever(bot: Bot, mem: Memory, chat_id: int, user_id: int, name: str) -> None:
     try:
         await bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
+        mem.record_ban(chat_id, user_id, name, None)
     except TelegramAPIError:
         pass
 
@@ -169,7 +167,8 @@ async def expire_captcha(bot: Bot, cfg: Config, mem: Memory, key: Key) -> None:
     chat_id, user_id = key
     mem.stat(chat_id).failed += 1
     await safe_delete(bot, chat_id, pending.message_id)
-    await punish(bot, cfg, chat_id, user_id)
+    name = pending.messages[0].from_user.first_name if pending.messages else "Без имени"
+    await punish(bot, cfg, mem, chat_id, user_id, name)
 
 
 async def send_captcha(message: Message, bot: Bot, cfg: Config, mem: Memory, key: Key) -> None:
@@ -247,7 +246,7 @@ async def on_captcha_answer(cb: CallbackQuery, bot: Bot, cfg: Config, mem: Memor
         mem.stat(chat_id).failed += 1
         await cb.answer(texts.failed(cfg.fail_ban_minutes), show_alert=True)
         await safe_delete(bot, chat_id, cb.message.message_id)
-        await punish(bot, cfg, chat_id, user_id)
+        await punish(bot, cfg, mem, chat_id, user_id, cb.from_user.first_name)
 
 
 # ---------- команды админов в группе ----------
@@ -275,6 +274,47 @@ async def cmd_status(message: Message, bot: Bot, mem: Memory, store: Storage) ->
             failed=st.failed,
         )
     )
+
+
+def unban_view(mem: Memory, chat_id: int):
+    bans = mem.active_bans(chat_id)
+    if not bans:
+        return texts.UNBAN_EMPTY, None
+    rows = []
+    for user_id, (name, until) in reversed(list(bans.items())):
+        when = "навсегда" if until is None else "до " + time.strftime("%H:%M", time.localtime(until))
+        rows.append([InlineKeyboardButton(text=f"🔓 {name[:30]} ({when})", callback_data=f"u:{user_id}")])
+    return texts.UNBAN_LIST, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(GROUPS, Command("unban"), IsAdmin())
+async def cmd_unban(message: Message, mem: Memory) -> None:
+    text, markup = unban_view(mem, message.chat.id)
+    await message.reply(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("u:"))
+async def on_unban(cb: CallbackQuery, bot: Bot, mem: Memory) -> None:
+    if cb.message is None:
+        await cb.answer()
+        return
+    chat_id = cb.message.chat.id
+    if cb.from_user.id not in await get_admins(bot, mem, chat_id):
+        await cb.answer(texts.UNBAN_ADMINS_ONLY, show_alert=True)
+        return
+    try:
+        user_id = int(cb.data.split(":")[1])
+        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+    except (ValueError, TelegramAPIError):
+        await cb.answer(texts.UNBAN_FAILED, show_alert=True)
+        return
+    name = mem.forget_ban(chat_id, user_id)
+    await cb.answer(f"{name or 'Человек'} снова может писать 🙂")
+    text, markup = unban_view(mem, chat_id)
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except TelegramAPIError:
+        pass
 
 
 @router.message(GROUPS, Command("addword"), IsAdmin())
@@ -392,13 +432,13 @@ async def check_message(
                 pending.task.cancel()
             await safe_delete(bot, chat_id, pending.message_id)
             stats.failed += 1
-            await ban_forever(bot, chat_id, user.id)
+            await ban_forever(bot, mem, chat_id, user.id, user.first_name)
         elif len(pending.messages) < MAX_HELD_MESSAGES:
             pending.messages.append(message)
         return
     if is_spam or user_name_is_spam(user, settings.words):
         stats.failed += 1
-        await ban_forever(bot, chat_id, user.id)
+        await ban_forever(bot, mem, chat_id, user.id, user.first_name)
         return
     await send_captcha(message, bot, cfg, mem, key)
 
